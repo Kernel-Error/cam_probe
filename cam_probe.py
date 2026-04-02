@@ -745,6 +745,7 @@ def probe_one(
     path: str,
     timeout: float,
     max_bytes: int,
+    skip_head: bool = False,
 ) -> Dict[str, Any]:
     output_dir = Path(f"cam_probe_{host}_{port}")
     timestamp = timestamp_utc()
@@ -765,60 +766,63 @@ def probe_one(
     status_code: Optional[int] = None
     content_type = ""
 
-    try:
-        head_resp = head_with_redirects(session, url, timeout)
-        status_code = head_resp.status_code
-        content_type = head_resp.headers.get("Content-Type", "") or ""
-        result["status"] = str(status_code)
-        result["content_type"] = content_type
-        head_resp.close()
-    except (RequestException, http.client.BadStatusLine) as exc:
-        jpeg_payload = extract_jpeg_from_exception(exc)
-        if jpeg_payload:
-            saved_file, saved_bytes = save_image_bytes(
-                jpeg_payload, output_dir, host, port, normalized_path, ".jpg"
-            )
-            markers.clear()
-            markers.append("jpeg_from_badstatusline")
-            result.update(
-                {
-                    "is_image": True,
-                    "marker": "jpeg_from_badstatusline",
-                    "bytes_saved": saved_bytes,
-                    "saved_file": saved_file,
-                    "content_type": "image/jpeg",
-                }
-            )
-            print_outcome(
-                url,
-                None,
-                result["content_type"],
-                result["marker"],
-                result["saved_file"],
-                True,
-            )
+    if not skip_head:
+        try:
+            head_resp = head_with_redirects(session, url, timeout)
+            status_code = head_resp.status_code
+            content_type = head_resp.headers.get("Content-Type", "") or ""
+            result["status"] = str(status_code)
+            result["content_type"] = content_type
+            head_resp.close()
+        except (RequestException, http.client.BadStatusLine) as exc:
+            jpeg_payload = extract_jpeg_from_exception(exc)
+            if jpeg_payload:
+                saved_file, saved_bytes = save_image_bytes(
+                    jpeg_payload, output_dir, host, port, normalized_path, ".jpg"
+                )
+                markers.clear()
+                markers.append("jpeg_from_badstatusline")
+                result.update(
+                    {
+                        "is_image": True,
+                        "marker": "jpeg_from_badstatusline",
+                        "bytes_saved": saved_bytes,
+                        "saved_file": saved_file,
+                        "content_type": "image/jpeg",
+                    }
+                )
+                print_outcome(
+                    url,
+                    None,
+                    result["content_type"],
+                    result["marker"],
+                    result["saved_file"],
+                    True,
+                )
+                return result
+            markers.append(f"head_error:{exc}")
+            result["marker"] = ";".join(markers)
+            print_outcome(url, None, content_type, result["marker"], "", False)
             return result
-        markers.append(f"head_error:{exc}")
-        result["marker"] = ";".join(markers)
-        print_outcome(url, None, content_type, result["marker"], "", False)
-        return result
 
-    should_get = False
-    if status_code in INTERESTING_STATUSES:
-        should_get = True
-    elif status_code in REDIRECT_STATUSES:
-        should_get = True
-    elif status_code == 405:
-        should_get = True
-    elif content_type.lower().startswith("image/"):
-        should_get = True
-    elif "mjpeg" in content_type.lower():
-        should_get = True
+        should_get = False
+        if status_code in INTERESTING_STATUSES:
+            should_get = True
+        elif status_code in REDIRECT_STATUSES:
+            should_get = True
+        elif status_code == 405:
+            should_get = True
+        elif status_code is not None and status_code >= 500:
+            should_get = True
+        elif content_type.lower().startswith("image/"):
+            should_get = True
+        elif "mjpeg" in content_type.lower():
+            should_get = True
 
-    if not should_get:
-        result["marker"] = ";".join(markers)
-        print_outcome(url, status_code, content_type, result["marker"], "", False)
-        return result
+        if not should_get:
+            result["marker"] = ";".join(markers)
+            print_outcome(url, status_code, content_type, result["marker"], "", False)
+            return result
 
     range_header = None
     if max_bytes > 0:
@@ -866,9 +870,36 @@ def probe_one(
         resp_encoding = resp.encoding
         result["status"] = str(status_code)
         result["content_type"] = content_type
-        buffer = read_stream_with_cap(resp, max_bytes)
+        try:
+            buffer = read_stream_with_cap(resp, max_bytes)
+        except (RequestException, OSError) as stream_exc:
+            buffer = b""
+            markers.append(f"read_error:{stream_exc}")
     finally:
         resp.close()
+
+    if status_code in (400, 416) and range_header is not None:
+        markers.append(f"range_rejected:{status_code}")
+        try:
+            resp, final_url = get_with_redirects(session, url, timeout)
+        except (RequestException, http.client.BadStatusLine) as exc:
+            markers.append(f"range_retry_error:{exc}")
+            result["marker"] = ";".join(markers)
+            print_outcome(url, None, content_type, result["marker"], "", False)
+            return result
+        try:
+            status_code = resp.status_code
+            content_type = resp.headers.get("Content-Type", "") or ""
+            resp_encoding = resp.encoding
+            result["status"] = str(status_code)
+            result["content_type"] = content_type
+            try:
+                buffer = read_stream_with_cap(resp, max_bytes)
+            except (RequestException, OSError) as stream_exc:
+                buffer = b""
+                markers.append(f"read_error:{stream_exc}")
+        finally:
+            resp.close()
 
     analysis = process_buffer(
         buffer,
@@ -901,7 +932,7 @@ def probe_one(
         )
         return result
 
-    if content_type.lower().startswith("text/html"):
+    if status_code == 200 and content_type.lower().startswith("text/html"):
         try:
             html_text = buffer.decode(resp_encoding or "utf-8")
         except Exception:
@@ -1061,6 +1092,22 @@ def build_cli() -> argparse.ArgumentParser:
         default=DEFAULT_USER_AGENT,
         help=f"User-Agent header to send (default: {DEFAULT_USER_AGENT}).",
     )
+    parser.add_argument(
+        "--skip-head",
+        action="store_true",
+        help="Skip HEAD preflight and go directly to GET (useful for cameras that reject HEAD).",
+    )
+    parser.add_argument(
+        "--no-verify-ssl",
+        action="store_true",
+        help="Disable TLS certificate verification (required for cameras with self-signed certs).",
+    )
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.15,
+        help="Average delay between requests per worker in seconds (default: 0.15).",
+    )
     parser.epilog = (
         "Examples:\n"
         "  python3 cam_probe.py -H 192.0.2.10 -p 88\n"
@@ -1092,6 +1139,10 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
+    if args.no_verify_ssl:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
     extra_paths = load_extra_paths(args.paths_file)
     paths = _dedupe_paths(DEFAULT_PATHS + extra_paths)
 
@@ -1107,6 +1158,8 @@ def main() -> None:
                     "Accept": "*/*",
                 }
             )
+            if args.no_verify_ssl:
+                sess.verify = False
             thread_local.session = sess
         return sess
 
@@ -1117,6 +1170,8 @@ def main() -> None:
         results: List[Dict[str, Any]] = []
 
         def task(path_item: str) -> Dict[str, Any]:
+            if args.delay > 0:
+                time.sleep(random.uniform(0, args.delay * 2))
             session = get_session()
             return probe_one(
                 session,
@@ -1126,6 +1181,7 @@ def main() -> None:
                 path_item,
                 args.timeout,
                 args.max_bytes,
+                skip_head=args.skip_head,
             )
 
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -1142,8 +1198,6 @@ def main() -> None:
                     print(red(f"[ERR] {url} worker_error:{exc}"))
                 else:
                     results.append(result)
-                finally:
-                    time.sleep(random.uniform(0.05, 0.25))
 
         results.sort(key=lambda row: row["path"])
         write_csv(results, output_dir)

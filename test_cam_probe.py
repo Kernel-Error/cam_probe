@@ -636,6 +636,139 @@ class TestProbeOne:
         assert result is not None
         assert result["url"] == "http://10.0.0.1:80/stream.jpg"
 
+    def test_skip_head_goes_directly_to_get(self):
+        """Issue #6: --skip-head bypasses HEAD and goes straight to GET."""
+        session = self._make_session()
+        get_resp = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            content=MINIMAL_JPEG,
+            is_redirect=False,
+        )
+        session.get.return_value = get_resp
+
+        result = cam_probe.probe_one(
+            session, "http", "10.0.0.1", 80, "/snap.jpg", 5.0, 524288,
+            skip_head=True,
+        )
+        assert not session.head.called
+        assert session.get.called
+        assert result["is_image"] is True
+
+    def test_500_head_still_triggers_get(self):
+        """Issue #6: A 500 HEAD response should still trigger a GET attempt."""
+        session = self._make_session()
+        head_resp = _fake_response(
+            status_code=500,
+            headers={"Content-Type": "text/html"},
+            is_redirect=False,
+        )
+        session.head.return_value = head_resp
+
+        get_resp = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            content=MINIMAL_JPEG,
+            is_redirect=False,
+        )
+        session.get.return_value = get_resp
+
+        result = cam_probe.probe_one(
+            session, "http", "10.0.0.1", 80, "/snap.jpg", 5.0, 524288
+        )
+        assert session.get.called
+        assert result["is_image"] is True
+
+    def test_range_rejected_416_retries_without_range(self):
+        """Issue #7: If GET with Range header returns 416, retry without Range."""
+        session = self._make_session()
+        head_resp = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            is_redirect=False,
+        )
+        session.head.return_value = head_resp
+
+        # First GET with Range → 416
+        range_rejected = _fake_response(
+            status_code=416,
+            headers={"Content-Type": "text/html"},
+            content=b"Range Not Satisfiable",
+            is_redirect=False,
+        )
+        # Retry without Range → 200 + image
+        retry_ok = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            content=MINIMAL_JPEG,
+            is_redirect=False,
+        )
+        session.get.side_effect = [range_rejected, retry_ok]
+
+        result = cam_probe.probe_one(
+            session, "http", "10.0.0.1", 80, "/snap.jpg", 5.0, 524288
+        )
+        assert result["is_image"] is True
+        assert "range_rejected:416" in result["marker"]
+
+    def test_range_rejected_400_retries_without_range(self):
+        """Issue #7: If GET with Range header returns 400, retry without Range."""
+        session = self._make_session()
+        head_resp = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            is_redirect=False,
+        )
+        session.head.return_value = head_resp
+
+        range_rejected = _fake_response(
+            status_code=400,
+            headers={"Content-Type": "text/html"},
+            content=b"Bad Request",
+            is_redirect=False,
+        )
+        retry_ok = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            content=MINIMAL_JPEG,
+            is_redirect=False,
+        )
+        session.get.side_effect = [range_rejected, retry_ok]
+
+        result = cam_probe.probe_one(
+            session, "http", "10.0.0.1", 80, "/snap.jpg", 5.0, 524288
+        )
+        assert result["is_image"] is True
+        assert "range_rejected:400" in result["marker"]
+
+    def test_range_retry_also_fails(self):
+        """Issue #7: If both ranged and non-ranged GET fail, return error result."""
+        session = self._make_session()
+        head_resp = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            is_redirect=False,
+        )
+        session.head.return_value = head_resp
+
+        range_rejected = _fake_response(
+            status_code=416,
+            headers={"Content-Type": "text/html"},
+            content=b"Range Not Satisfiable",
+            is_redirect=False,
+        )
+        session.get.side_effect = [
+            range_rejected,
+            requests.ConnectionError("retry also failed"),
+        ]
+
+        result = cam_probe.probe_one(
+            session, "http", "10.0.0.1", 80, "/snap.jpg", 5.0, 524288
+        )
+        assert result["is_image"] is False
+        assert "range_rejected:416" in result["marker"]
+        assert "range_retry_error" in result["marker"]
+
 
 # ---------------------------------------------------------------------------
 # CLI / argument parsing
@@ -657,6 +790,9 @@ class TestBuildCli:
         assert args.workers == 24
         assert args.timeout == 8.0
         assert args.max_bytes == 524288
+        assert args.skip_head is False
+        assert args.no_verify_ssl is False
+        assert args.delay == 0.15
 
     def test_all_options(self):
         parser = cam_probe.build_cli()
@@ -676,6 +812,21 @@ class TestBuildCli:
         assert args.timeout == 3.5
         assert args.max_bytes == 1024
         assert args.user_agent == "test/1.0"
+
+    def test_no_verify_ssl_flag(self):
+        parser = cam_probe.build_cli()
+        args = parser.parse_args(["-H", "10.0.0.1", "-p", "443", "--no-verify-ssl"])
+        assert args.no_verify_ssl is True
+
+    def test_skip_head_flag(self):
+        parser = cam_probe.build_cli()
+        args = parser.parse_args(["-H", "10.0.0.1", "-p", "80", "--skip-head"])
+        assert args.skip_head is True
+
+    def test_delay_flag(self):
+        parser = cam_probe.build_cli()
+        args = parser.parse_args(["-H", "10.0.0.1", "-p", "80", "--delay", "0.5"])
+        assert args.delay == 0.5
 
 
 class TestParsePorts:
