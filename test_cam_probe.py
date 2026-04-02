@@ -559,6 +559,83 @@ class TestProbeOne:
         assert session.get.called
         assert result["status"] == "401"
 
+    def test_401_html_with_logo_is_not_false_positive(self):
+        """Issue #3: A 401 HTML page containing an <img src> for a vendor logo
+        must NOT be reported as a found camera snapshot. Currently the HTML
+        follow-through runs regardless of status code, causing false positives."""
+        session = self._make_session()
+        head_resp = _fake_response(
+            status_code=401,
+            headers={"Content-Type": "text/html"},
+            is_redirect=False,
+        )
+        session.head.return_value = head_resp
+
+        login_html = (
+            b'<html><body><h1>Login Required</h1>'
+            b'<img src="/images/logo.png"></body></html>'
+        )
+        get_resp_html = _fake_response(
+            status_code=401,
+            headers={"Content-Type": "text/html; charset=utf-8"},
+            content=login_html,
+            is_redirect=False,
+            encoding="utf-8",
+        )
+        # If the code follows the img src, this is what it would get:
+        get_resp_logo = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/png"},
+            content=PNG_HEADER + b"\x00" * 50,
+            is_redirect=False,
+        )
+        session.get.side_effect = [get_resp_html, get_resp_logo]
+
+        result = cam_probe.probe_one(
+            session, "http", "10.0.0.1", 80, "/admin", 5.0, 524288
+        )
+        # This assertion documents the *desired* behavior.
+        # It will FAIL until issue #3 is fixed — the HTML follow-through
+        # should be gated on status_code == 200.
+        assert result["is_image"] is False, (
+            "401 login page logo was incorrectly detected as a camera snapshot"
+        )
+
+    def test_mid_stream_read_failure_still_produces_result(self):
+        """Issue #5: If iter_content() raises mid-stream after a successful GET,
+        the path should still appear in results with an error marker, not vanish."""
+        session = self._make_session()
+        head_resp = _fake_response(
+            status_code=200,
+            headers={"Content-Type": "image/jpeg"},
+            is_redirect=False,
+        )
+        session.head.return_value = head_resp
+
+        # Build a GET response whose iter_content raises mid-stream
+        get_resp = MagicMock(spec=requests.Response)
+        get_resp.status_code = 200
+        get_resp.headers = {"Content-Type": "image/jpeg"}
+        get_resp.is_redirect = False
+        get_resp.encoding = "utf-8"
+        get_resp.close = MagicMock()
+
+        def exploding_iter(chunk_size=8192):
+            yield b"\xff\xd8"  # partial JPEG start
+            raise requests.ConnectionError("connection reset mid-stream")
+
+        get_resp.iter_content = exploding_iter
+        session.get.return_value = get_resp
+
+        result = cam_probe.probe_one(
+            session, "http", "10.0.0.1", 80, "/stream.jpg", 5.0, 524288
+        )
+        # The result dict should exist (not swallowed as worker_error).
+        # Currently this may raise and produce no CSV row — the test
+        # documents the desired behavior for issue #5.
+        assert result is not None
+        assert result["url"] == "http://10.0.0.1:80/stream.jpg"
+
 
 # ---------------------------------------------------------------------------
 # CLI / argument parsing
