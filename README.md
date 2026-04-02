@@ -33,6 +33,8 @@ python3 cam_probe.py -H 192.168.0.10 -p 88
 python3 cam_probe.py -H 192.0.2.10 -p 88
 python3 cam_probe.py -H 198.51.100.5 --ports 80,81,88,8080 -w 32 -t 10
 python3 cam_probe.py -H 203.0.113.7 -p 81 --paths-file camera_paths_mega.txt
+python3 cam_probe.py -H 192.168.1.5 -p 443 --scheme https --no-verify-ssl
+python3 cam_probe.py -H 192.168.1.5 -p 80 --skip-head --delay 0.3
 ```
 
 ---
@@ -66,6 +68,9 @@ pip install requests
 --max-bytes           Max bytes to read per response (default: 512 KB)
 --paths-file          Custom file with additional camera paths
 --user-agent          Custom User-Agent header
+--skip-head           Skip HEAD preflight, go directly to GET
+--no-verify-ssl       Disable TLS cert verification (self-signed certs)
+--delay               Avg delay between requests per worker (default: 0.15s)
 ```
 
 ---
@@ -84,6 +89,16 @@ pip install requests
 
 - Python ≥ 3.8  
 - requests ≥ 2.31.0
+
+---
+
+## 🧪 Testing
+
+```bash
+pytest test_cam_probe.py -v
+```
+
+92 tests covering all core logic. All HTTP interactions are mocked — no network access or camera required.
 
 ---
 
